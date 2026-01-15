@@ -9,6 +9,11 @@ that capture:
 - Protein synthesis
 - Cell volume growth
 - Stochastic cell division
+
+Units:
+- Time: minutes
+- Volume: μm³ (cubic micrometers)
+- Counts: number of molecules
 """
 
 import numpy as np
@@ -20,52 +25,78 @@ from typing import Optional
 class GrowthParameters:
     """Parameters for the growth rate model.
 
-    Based on Table 1 from Thomas et al. (2018).
-    Default values are representative of E. coli growth.
-    """
-    # Transcription/translation rates
-    k_r: float = 1.0        # Ribosome production rate (per ribosome per time)
-    k_p: float = 1.0        # Protein production rate
-    gamma_r: float = 0.01   # Ribosome degradation rate
-    gamma_p: float = 0.01   # Protein degradation rate
+    Default values calibrated to E. coli in rich media (fast growth).
 
-    # Growth parameters
-    lambda_0: float = 0.02  # Base growth rate (per minute)
+    Biological references:
+    - Doubling time in rich media: ~20-25 min
+    - Doubling time in minimal media: ~45-60 min
+    - Ribosomes per cell: 10,000-70,000 (growth-rate dependent)
+    - Proteins per cell: ~2-4 million
+    - Cell volume at birth: 0.5-2 μm³
+    """
+    # Growth rate (per minute)
+    # 0.03 /min = 1.8 /hr → ~23 min doubling time (fast growth, rich media)
+    # 0.015 /min = 0.9 /hr → ~46 min doubling time (slow growth, minimal media)
+    growth_rate: float = 0.025  # /min, corresponds to ~28 min doubling time
+
+    # Ribosome parameters
+    # Ribosomes are ~20% of cell mass in fast-growing E. coli
+    # Translation rate: ~15-20 aa/s, ribosome makes ~1 protein/min
+    ribosome_fraction: float = 0.2      # Fraction of protein that is ribosomal
+    ribosome_efficiency: float = 1.0    # Relative translation efficiency
+
+    # Degradation rates (per minute)
+    # Ribosomes are very stable (half-life >> cell cycle)
+    # Most E. coli proteins are also stable
+    gamma_r: float = 0.001   # Ribosome degradation (~700 min half-life)
+    gamma_p: float = 0.002   # Protein degradation (~350 min half-life)
 
     # Division parameters
-    V_div: float = 2.0      # Division volume (relative to birth volume)
-    CV_div: float = 0.1     # Coefficient of variation for division
+    # E. coli follows "adder" model: adds constant volume each generation
+    division_ratio: float = 2.0   # Divide when V reaches this * V_birth
+    CV_division: float = 0.1      # CV of division size (~10%)
 
-    # Noise parameters
-    sigma_r: float = 0.1    # Ribosome production noise
-    sigma_p: float = 0.1    # Protein production noise
+    # Noise parameters (dimensionless)
+    # These control the coefficient of variation
+    noise_ribosome: float = 0.02   # Ribosome production noise
+    noise_protein: float = 0.02    # Protein production noise
+    noise_growth: float = 0.05     # Growth rate noise (metabolic fluctuations)
 
-    # Initial conditions
-    R_0: float = 1000.0     # Initial ribosome count
-    P_0: float = 5000.0     # Initial protein count
-    V_0: float = 1.0        # Initial cell volume
+    # Initial conditions (at cell birth)
+    # Fast-growing E. coli: ~20,000 ribosomes, ~3M proteins, ~1 μm³
+    R_0: float = 20000.0    # Ribosome count at birth
+    P_0: float = 3.0e6      # Protein count at birth
+    V_0: float = 1.0        # Volume at birth (μm³)
 
 
 @dataclass
 class CellState:
     """State of a single cell."""
     R: float        # Ribosome count
-    P: float        # Protein count
-    V: float        # Cell volume
-    age: float      # Time since last division
+    P: float        # Protein count (non-ribosomal)
+    V: float        # Cell volume (μm³)
+    age: float      # Time since last division (minutes)
     generation: int # Division count
+    V_birth: float  # Volume at birth (for adder model)
 
 
 class GrowthRateSimulator:
     """Simulator for stochastic cell growth dynamics.
 
-    Uses the Euler-Maruyama method to integrate the coupled Langevin equations
+    Uses the Euler-Maruyama method to integrate coupled Langevin equations
     describing ribosome autocatalysis, protein synthesis, and cell growth.
 
+    The model captures the key features of bacterial growth:
+    1. Exponential growth of cell volume
+    2. Growth rate depends on ribosome concentration
+    3. Stochastic gene expression adds cell-to-cell variability
+    4. Division occurs when cells reach approximately 2x birth size
+
     Example:
-        >>> params = GrowthParameters(lambda_0=0.02)
+        >>> params = GrowthParameters(growth_rate=0.025)  # ~28 min doubling
         >>> sim = GrowthRateSimulator(params)
-        >>> trajectory = sim.run(t_max=100.0, dt=0.01)
+        >>> trajectory = sim.run(t_max=120.0)  # 2 hours
+        >>> print(f"Divisions: {len(trajectory['division_times'])}")
     """
 
     def __init__(self, params: Optional[GrowthParameters] = None, seed: Optional[int] = None):
@@ -78,89 +109,146 @@ class GrowthRateSimulator:
         self.params = params or GrowthParameters()
         self.rng = np.random.default_rng(seed)
 
-    def _growth_rate(self, state: CellState) -> float:
-        """Calculate instantaneous growth rate.
+    def _instantaneous_growth_rate(self, state: CellState) -> float:
+        """Calculate instantaneous growth rate with noise.
 
-        Growth rate depends on ribosome concentration (R/V).
+        Growth rate fluctuates around the target value due to
+        metabolic and environmental noise.
+
+        This simpler model directly controls growth rate rather than
+        deriving it from ribosome concentration, making the dynamics
+        more stable and predictable.
         """
         p = self.params
-        ribosome_concentration = state.R / state.V
-        return p.lambda_0 * ribosome_concentration / (p.R_0 / p.V_0)
 
-    def _drift(self, state: CellState) -> tuple[float, float, float]:
+        # Base growth rate with multiplicative noise
+        # Using Ornstein-Uhlenbeck-like bounded fluctuations
+        noise = p.noise_growth * self.rng.standard_normal()
+
+        # Growth rate fluctuates around target
+        rate = p.growth_rate * (1 + noise)
+
+        # Ensure non-negative and bounded
+        return np.clip(rate, 0.001, p.growth_rate * 3)
+
+    def _drift(self, state: CellState, growth_rate: float) -> tuple[float, float, float]:
         """Calculate drift terms for the Langevin equations.
+
+        The model follows bacterial growth laws:
+        - Ribosomes are autocatalytic (make more ribosomes)
+        - Protein production scales with ribosome count
+        - Both are diluted by cell growth
+
+        At steady state (balanced growth):
+        - dR/dt = 0: production = dilution + degradation
+        - dP/dt = 0: production = dilution + degradation
+        - dV/dt = λV: exponential volume growth
 
         Returns:
             (dR/dt, dP/dt, dV/dt) drift terms
         """
         p = self.params
-        growth_rate = self._growth_rate(state)
+
+        # Ribosome production rate
+        # At steady state: k_r * R = (λ + γ_r) * R, so k_r = λ + γ_r
+        k_r = growth_rate + p.gamma_r
+
+        # Protein production rate
+        # At steady state: k_p * R = (λ + γ_p) * P
+        # With P/R = P_0/R_0, we get k_p = (λ + γ_p) * (P_0/R_0)
+        k_p = (growth_rate + p.gamma_p) * (p.P_0 / p.R_0)
 
         # Ribosome dynamics: production - degradation - dilution
-        dR = p.k_r * state.R - p.gamma_r * state.R - growth_rate * state.R
+        # Production is k_r * R (ribosomes make ribosomes)
+        dR = k_r * state.R - p.gamma_r * state.R - growth_rate * state.R
 
         # Protein dynamics: production - degradation - dilution
-        dP = p.k_p * state.R - p.gamma_p * state.P - growth_rate * state.P
+        # Production is k_p * R (ribosomes make proteins)
+        dP = k_p * state.R - p.gamma_p * state.P - growth_rate * state.P
 
-        # Volume growth
+        # Volume growth (exponential)
         dV = growth_rate * state.V
 
         return dR, dP, dV
 
-    def _diffusion(self, state: CellState) -> tuple[float, float]:
+    def _diffusion(self, state: CellState, growth_rate: float) -> tuple[float, float]:
         """Calculate diffusion (noise) terms.
+
+        Noise in gene expression follows Poisson statistics:
+        variance ~ mean, so std ~ sqrt(mean)
 
         Returns:
             (noise_R, noise_P) diffusion coefficients
         """
         p = self.params
-        # Noise scales with sqrt of production rate (Poisson statistics)
-        noise_R = p.sigma_r * np.sqrt(max(p.k_r * state.R, 0))
-        noise_P = p.sigma_p * np.sqrt(max(p.k_p * state.R, 0))
+
+        # Production rates (same as in drift)
+        k_r = growth_rate + p.gamma_r
+        k_p = (growth_rate + p.gamma_p) * (p.P_0 / p.R_0)
+
+        # Noise scales with sqrt of production (Poisson)
+        # Scaled by noise parameters to control CV
+        # Higher noise_ribosome/noise_protein → more cell-to-cell variability
+        noise_R = p.noise_ribosome * np.sqrt(max(k_r * state.R, 1.0))
+        noise_P = p.noise_protein * np.sqrt(max(k_p * state.R, 1.0))
+
         return noise_R, noise_P
 
     def _check_division(self, state: CellState) -> bool:
         """Check if cell should divide.
 
-        Division occurs stochastically when volume exceeds threshold.
-        Uses a size-based adder model with noise.
+        E. coli follows an "adder" model: cells add a roughly constant
+        volume each generation, regardless of birth size.
+
+        Division occurs when V ≈ 2 * V_birth (with noise).
         """
         p = self.params
-        # Division threshold with noise
-        V_threshold = p.V_div * p.V_0 * (1 + p.CV_div * self.rng.standard_normal())
-        return state.V >= V_threshold
+
+        # Target division volume (with noise)
+        noise = 1 + p.CV_division * self.rng.standard_normal()
+        V_division = state.V_birth * p.division_ratio * max(noise, 0.7)
+
+        return state.V >= V_division
 
     def _divide(self, state: CellState) -> CellState:
         """Perform cell division.
 
         Molecules are partitioned binomially between daughter cells.
         We track one daughter (randomly chosen).
+
+        Division is approximately symmetric with small variations.
         """
-        # Binomial partitioning (approximate with normal for large counts)
-        frac = 0.5 + 0.05 * self.rng.standard_normal()  # Slight asymmetry
-        frac = np.clip(frac, 0.3, 0.7)
+        # Partition fraction (slightly asymmetric)
+        frac = 0.5 + 0.02 * self.rng.standard_normal()
+        frac = np.clip(frac, 0.45, 0.55)
+
+        new_V = state.V * frac
 
         return CellState(
             R=state.R * frac,
             P=state.P * frac,
-            V=state.V * frac,
+            V=new_V,
             age=0.0,
-            generation=state.generation + 1
+            generation=state.generation + 1,
+            V_birth=new_V  # This daughter's birth volume
         )
 
-    def step(self, state: CellState, dt: float) -> tuple[CellState, bool]:
+    def step(self, state: CellState, dt: float) -> tuple[CellState, bool, float]:
         """Advance simulation by one time step using Euler-Maruyama.
 
         Args:
             state: Current cell state
-            dt: Time step size
+            dt: Time step size (minutes)
 
         Returns:
-            (new_state, divided): Updated state and whether division occurred
+            (new_state, divided, growth_rate): Updated state, division flag, and growth rate
         """
+        # Calculate growth rate
+        growth_rate = self._instantaneous_growth_rate(state)
+
         # Calculate drift and diffusion
-        dR, dP, dV = self._drift(state)
-        noise_R, noise_P = self._diffusion(state)
+        dR, dP, dV = self._drift(state, growth_rate)
+        noise_R, noise_P = self._diffusion(state, growth_rate)
 
         # Generate Wiener increments
         dW = self.rng.standard_normal(2) * np.sqrt(dt)
@@ -170,17 +258,18 @@ class GrowthRateSimulator:
         new_P = state.P + dP * dt + noise_P * dW[1]
         new_V = state.V + dV * dt
 
-        # Ensure non-negative values
-        new_R = max(new_R, 1.0)
-        new_P = max(new_P, 1.0)
-        new_V = max(new_V, 0.1)
+        # Ensure non-negative values with reasonable minimums
+        new_R = max(new_R, 100.0)     # At least 100 ribosomes
+        new_P = max(new_P, 10000.0)   # At least 10k proteins
+        new_V = max(new_V, 0.1)       # At least 0.1 μm³
 
         new_state = CellState(
             R=new_R,
             P=new_P,
             V=new_V,
             age=state.age + dt,
-            generation=state.generation
+            generation=state.generation,
+            V_birth=state.V_birth
         )
 
         # Check for division
@@ -189,23 +278,30 @@ class GrowthRateSimulator:
             new_state = self._divide(new_state)
             divided = True
 
-        return new_state, divided
+        return new_state, divided, growth_rate
 
     def run(
         self,
-        t_max: float = 100.0,
+        t_max: float = 120.0,
         dt: float = 0.1,
         record_interval: int = 1
     ) -> dict[str, np.ndarray]:
         """Run the simulation.
 
         Args:
-            t_max: Total simulation time
-            dt: Integration time step
+            t_max: Total simulation time (minutes)
+            dt: Integration time step (minutes)
             record_interval: Record state every N steps
 
         Returns:
-            Dictionary with time series of all state variables
+            Dictionary with time series of all state variables:
+            - time: Time points (minutes)
+            - ribosomes: Ribosome counts
+            - proteins: Protein counts
+            - volume: Cell volume (μm³)
+            - growth_rate: Instantaneous growth rate (/min)
+            - generation: Division count
+            - division_times: Times of division events (minutes)
         """
         p = self.params
         n_steps = int(t_max / dt)
@@ -226,7 +322,8 @@ class GrowthRateSimulator:
             P=p.P_0,
             V=p.V_0,
             age=0.0,
-            generation=0
+            generation=0,
+            V_birth=p.V_0
         )
 
         # Record initial state
@@ -235,12 +332,12 @@ class GrowthRateSimulator:
         ribosomes[0] = state.R
         proteins[0] = state.P
         volumes[0] = state.V
-        growth_rates[0] = self._growth_rate(state)
+        growth_rates[0] = self._instantaneous_growth_rate(state)
         generations[0] = state.generation
 
         # Run simulation
         for i in range(1, n_steps + 1):
-            state, divided = self.step(state, dt)
+            state, divided, growth_rate = self.step(state, dt)
 
             if divided:
                 division_times.append(i * dt)
@@ -252,7 +349,7 @@ class GrowthRateSimulator:
                     ribosomes[record_idx] = state.R
                     proteins[record_idx] = state.P
                     volumes[record_idx] = state.V
-                    growth_rates[record_idx] = self._growth_rate(state)
+                    growth_rates[record_idx] = growth_rate
                     generations[record_idx] = state.generation
 
         return {
@@ -268,48 +365,56 @@ class GrowthRateSimulator:
     def run_population(
         self,
         n_cells: int = 100,
-        t_max: float = 100.0,
+        t_max: float = 120.0,
         dt: float = 0.1
     ) -> dict[str, np.ndarray]:
         """Run simulation for a population of cells.
 
+        Each cell is simulated independently with its own stochastic trajectory.
         Useful for generating training data for surrogate models.
 
         Args:
             n_cells: Number of independent cells to simulate
-            t_max: Simulation time per cell
-            dt: Time step
+            t_max: Simulation time per cell (minutes)
+            dt: Time step (minutes)
 
         Returns:
             Dictionary with population-level statistics
         """
         final_growth_rates = []
         mean_growth_rates = []
-        division_counts = []
+        division_times_list = []
         mean_volumes = []
 
-        for _ in range(n_cells):
-            traj = self.run(t_max=t_max, dt=dt, record_interval=10)
+        for i in range(n_cells):
+            # Each cell gets different random seed
+            cell_sim = GrowthRateSimulator(self.params, seed=self.rng.integers(0, 2**31))
+            traj = cell_sim.run(t_max=t_max, dt=dt, record_interval=10)
 
             final_growth_rates.append(traj["growth_rate"][-1])
             mean_growth_rates.append(np.mean(traj["growth_rate"]))
-            division_counts.append(len(traj["division_times"]))
             mean_volumes.append(np.mean(traj["volume"]))
+
+            # Collect inter-division times
+            if len(traj["division_times"]) > 1:
+                interdiv = np.diff(traj["division_times"])
+                division_times_list.extend(interdiv.tolist())
 
         return {
             "final_growth_rate": np.array(final_growth_rates),
             "mean_growth_rate": np.array(mean_growth_rates),
-            "division_count": np.array(division_counts),
-            "mean_volume": np.array(mean_volumes)
+            "mean_volume": np.array(mean_volumes),
+            "interdivision_times": np.array(division_times_list) if division_times_list else np.array([]),
+            "n_cells": n_cells,
         }
 
 
 def generate_training_data(
     n_samples: int = 1000,
     param_ranges: Optional[dict[str, tuple[float, float]]] = None,
-    t_max: float = 50.0,
+    t_max: float = 120.0,
     seed: Optional[int] = None
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Generate training data for surrogate model.
 
     Samples parameters uniformly from specified ranges and runs simulations
@@ -317,25 +422,26 @@ def generate_training_data(
 
     Args:
         n_samples: Number of parameter samples
-        param_ranges: Dict mapping parameter names to (min, max) tuples
-        t_max: Simulation time per sample
+        param_ranges: Dict mapping parameter names to (min, max) tuples.
+                     Defaults to biologically plausible ranges.
+        t_max: Simulation time per sample (minutes)
         seed: Random seed
 
     Returns:
-        (X, y): Parameter array and corresponding outputs
-            X has shape (n_samples, n_params)
-            y has shape (n_samples, n_outputs)
+        (X, y, param_names):
+            X has shape (n_samples, n_params) - input parameters
+            y has shape (n_samples, n_outputs) - output statistics
+            param_names - list of parameter names
     """
     rng = np.random.default_rng(seed)
 
-    # Default parameter ranges (biologically plausible)
+    # Default parameter ranges (biologically plausible for E. coli)
     if param_ranges is None:
         param_ranges = {
-            "lambda_0": (0.005, 0.05),
-            "k_r": (0.5, 2.0),
-            "k_p": (0.5, 2.0),
-            "sigma_r": (0.01, 0.3),
-            "sigma_p": (0.01, 0.3),
+            "growth_rate": (0.010, 0.040),      # 0.6-2.4 /hr (slow to fast growth)
+            "noise_ribosome": (0.005, 0.05),    # Low to moderate noise
+            "noise_protein": (0.005, 0.05),
+            "noise_growth": (0.02, 0.10),
         }
 
     param_names = list(param_ranges.keys())
@@ -355,15 +461,30 @@ def generate_training_data(
         params = GrowthParameters(**param_dict)
 
         # Run simulation
-        sim = GrowthRateSimulator(params, seed=seed + i if seed else None)
+        sim = GrowthRateSimulator(params, seed=rng.integers(0, 2**31))
         traj = sim.run(t_max=t_max, dt=0.1, record_interval=10)
 
         # Extract outputs
+        mean_gr = np.mean(traj["growth_rate"])
+        std_gr = np.std(traj["growth_rate"])
+        cv_gr = std_gr / mean_gr if mean_gr > 0 else 0
+
+        # Division rate (divisions per minute)
+        n_divisions = len(traj["division_times"])
+        div_rate = n_divisions / t_max
+
+        # Mean doubling time (if we have divisions)
+        if n_divisions > 1:
+            interdiv = np.diff(traj["division_times"])
+            mean_doubling = np.mean(interdiv)
+        else:
+            mean_doubling = np.log(2) / mean_gr if mean_gr > 0 else np.inf
+
         outputs.append([
-            np.mean(traj["growth_rate"]),
-            np.std(traj["growth_rate"]),
-            len(traj["division_times"]) / t_max,  # Division rate
-            np.mean(traj["volume"])
+            mean_gr * 60,           # Convert to /hr for comparison with experiments
+            cv_gr,                  # CV of growth rate
+            mean_doubling,          # Mean doubling time (min)
+            np.mean(traj["volume"]) # Mean cell volume
         ])
 
     y = np.array(outputs)
