@@ -46,3 +46,6 @@ data/*.pt
 
 # OS
 .DS_Store
+
+# Private docs (development logs)
+docs/
